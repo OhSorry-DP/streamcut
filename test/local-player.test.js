@@ -230,7 +230,7 @@ function fixture(t, options = {}) {
   };
   const player = createLocalPlayer('player', {
     prepare: async id => { prepareCalls++; return options.prepare ? options.prepare(id, prepareCalls) : { path: `/preview/token${prepareCalls === 1 ? '' : prepareCalls}.mp4` }; },
-    onError: error => errors.push(error), onTime: time => times.push(time), onBuffering: value => buffering.push(value),
+    onError: error => errors.push(error), onTime: time => times.push(time), onBuffering: value => buffering.push(value), onSeek: options.onSeek,
   });
   t.after(() => {
     player.destroy(); assert.equal(live.size, 0);
@@ -786,7 +786,9 @@ test('local player renders its DOM and formats playback time across hour boundar
   const hud = f.find('local-player-hud'), time = f.find('local-player-time'), progress = f.find('local-player-progress');
   assert.deepEqual(shell.children, [f.video, feedback, hud]);
   assert.deepEqual(f.container.children, [shell]);
-  assert.deepEqual(hud.children, [time, progress]);
+  const hit = f.find('local-player-progress-hit');
+  assert.deepEqual(hud.children, [time, hit]);
+  assert.deepEqual(hit.children, [progress]);
   assert.equal(feedback.getAttribute('aria-hidden'), 'true');
   assert.equal(time.getAttribute('aria-label'), '재생 시간');
   assert.equal(progress.getAttribute('aria-label'), '재생 위치');
@@ -826,10 +828,10 @@ test('only an unmodified primary click on the video toggles playback', async t =
   let calls = 0; const original = f.player.togglePlay;
   t.mock.method(f.player, 'togglePlay', function (...args) { calls++; return original.apply(this, args); });
   const shell = f.find('local-player-shell'), hud = f.find('local-player-hud');
-  const time = f.find('local-player-time'), progress = f.find('local-player-progress');
+  const time = f.find('local-player-time'), progress = f.find('local-player-progress'), hit = f.find('local-player-progress-hit');
   f.video.emit('click'); await flush(); assert.equal(f.video.paused, false); assert.equal(calls, 1);
   f.video.emit('click'); await flush(); assert.equal(f.video.paused, true); assert.equal(calls, 2);
-  for (const node of [shell, hud, time, progress, f.container]) { node.emit('click'); await flush(); assert.equal(calls, 2); assert.equal(f.video.paused, true); }
+  for (const node of [shell, hud, time, hit, progress, f.container]) { node.emit('click'); await flush(); assert.equal(calls, 2); assert.equal(f.video.paused, true); }
   f.video.emit('click', { target: hud }); f.video.emit('click', { button: 2 }); f.video.emit('click', { defaultPrevented: true });
   assert.equal(calls, 2); assert.equal(f.video.paused, true);
   const fake = document.createElement('button'); f.video.parentNode.parentNode.replaceChildren(f.video.parentNode, fake);
@@ -878,4 +880,90 @@ test('reload and destroy clear feedback timers, DOM listeners, and callbacks', a
   t.mock.timers.tick(1000); await flush(); f.video.emit('click');
   assert.equal(f.times.length, timeCount); assert.deepEqual(f.container.children, []);
   assert.equal(feedback.classList.contains('is-visible'), false); assert.equal(f.live.size, 0);
+});
+
+test('local player click seeks across the full source duration and clamps', async t => {
+  const seeks = [], f = fixture(t, { onSeek: sec => seeks.push(sec) }); await f.load(70, 1000);
+  const hit = f.find('local-player-progress-hit'); hit.getBoundingClientRect = () => ({ left: 100, width: 200 });
+  const fetchCount = f.fetches.length;
+  for (const clientX of [100, 150, 200, 300, 90, 310]) hit.emit('click', { clientX });
+  assert.deepEqual(seeks, [0, 250, 500, 1000, 0, 1000]);
+  assert.equal(f.player.getTime(), 70); assert.equal(f.video.currentTime, 70); assert.equal(f.fetches.length, fetchCount);
+});
+
+test('local player progress click seeks without toggling or showing feedback', async t => {
+  const seeks = [], f = fixture(t, { onSeek: sec => seeks.push(sec) }); await f.load(10);
+  const hit = f.find('local-player-progress-hit'), progress = f.find('local-player-progress'), shell = f.find('local-player-shell');
+  const feedback = f.find('local-player-feedback'); hit.getBoundingClientRect = () => ({ left: 100, width: 200 });
+  let toggles = 0, shellClicks = 0;
+  const original = f.player.togglePlay;
+  t.mock.method(f.player, 'togglePlay', function (...args) { toggles++; return original.apply(this, args); });
+  shell.addEventListener('click', () => { shellClicks++; });
+  progress.emit('click', { clientX: 200 });
+  assert.deepEqual(seeks, [500]); assert.equal(shellClicks, 0); assert.equal(toggles, 0);
+  assert.equal(f.video.paused, true); assert.equal(feedback.textContent, ''); assert.equal(feedback.classList.contains('is-visible'), false);
+  hit.emit('click', { clientX: 200 }); assert.deepEqual(seeks, [500, 500]); assert.equal(shellClicks, 0); assert.equal(toggles, 0);
+  f.video.emit('click'); await flush();
+  assert.equal(toggles, 1); assert.equal(feedback.classList.contains('is-visible'), true);
+});
+
+test('local player click ignores invalid buttons coordinates and rectangles', async t => {
+  const seeks = [], f = fixture(t, { onSeek: sec => seeks.push(sec) }); await f.load(10);
+  const hit = f.find('local-player-progress-hit'); let rect = { left: 100, width: 200 };
+  hit.getBoundingClientRect = () => rect;
+  for (const overrides of [
+    { button: 2, clientX: 200 }, { defaultPrevented: true, clientX: 200 },
+    { clientX: NaN }, { clientX: Infinity },
+  ]) { rect = { left: 100, width: 200 }; hit.emit('click', overrides); assert.equal(seeks.length, 0); }
+  for (const width of [0, -1, NaN, Infinity]) { rect = { left: 100, width }; hit.emit('click', { clientX: 200 }); assert.equal(seeks.length, 0); }
+  rect = { left: NaN, width: 200 }; hit.emit('click', { clientX: 200 }); assert.equal(seeks.length, 0);
+  rect = { left: 100, width: 200 }; hit.emit('click', { clientX: 200, ctrlKey: true, shiftKey: true, altKey: true, metaKey: true });
+  assert.deepEqual(seeks, [500]);
+});
+
+test('local player click waits for load and ignores zero duration or missing callback', async t => {
+  await t.test('load states and zero duration', async t => {
+    const seeks = [], f = fixture(t, { onSeek: sec => seeks.push(sec) });
+    const hit = f.find('local-player-progress-hit'); hit.getBoundingClientRect = () => ({ left: 100, width: 200 });
+    hit.emit('click', { clientX: 200 }); assert.deepEqual(seeks, []);
+    const pending = f.start(10, 1000); await flush();
+    hit.emit('click', { clientX: 200 }); assert.deepEqual(seeks, []);
+    await f.ready(); await pending; hit.emit('click', { clientX: 200 }); assert.deepEqual(seeks, [500]);
+    await f.load(0, 0); hit.emit('click', { clientX: 200 }); assert.deepEqual(seeks, [500]);
+  });
+  await t.test('missing callback', async t => {
+    const f = fixture(t); await f.load(10);
+    const hit = f.find('local-player-progress-hit'); hit.getBoundingClientRect = () => ({ left: 100, width: 200 });
+    const time = f.player.getTime();
+    assert.doesNotThrow(() => hit.emit('click', { clientX: 200 }));
+    assert.equal(f.player.getTime(), time);
+  });
+});
+
+test('local player failed and destroyed states remove click handlers', async t => {
+  const seeks = [], f = fixture(t, { onSeek: sec => seeks.push(sec) }); await f.load(10);
+  const hit = f.find('local-player-progress-hit'); hit.getBoundingClientRect = () => ({ left: 100, width: 200 });
+  f.video.emit('error'); await flush(); await f.ready();
+  f.video.emit('error'); await flush(); seeks.length = 0;
+  hit.emit('click', { clientX: 200 }); assert.deepEqual(seeks, []);
+  f.player.destroy();
+  assert.equal(hit.listeners.size, 0); assert.equal(f.video.listeners.size, 0); assert.deepEqual(f.container.children, []);
+  hit.emit('click', { clientX: 200 }); t.mock.timers.tick(1000); await flush(); assert.deepEqual(seeks, []);
+});
+
+test('local player reload and endpoint clicks retain the seekAndPlay path', async t => {
+  let f; const seeks = [];
+  f = fixture(t, { onSeek: sec => { seeks.push(sec); void f.player.seekAndPlay(sec); } }); await f.load(10, 1000);
+  const hit = f.find('local-player-progress-hit'), feedback = f.find('local-player-feedback');
+  hit.getBoundingClientRect = () => ({ left: 100, width: 200 });
+  f.range([[10, 30]], 10); let toggles = 0;
+  t.mock.method(f.player, 'togglePlay', () => { toggles++; });
+  hit.emit('click', { clientX: 104 }); await flush();
+  assert.deepEqual(seeks, [20]); assert.equal(f.player.getTime(), 20); assert.equal(f.video.currentTime, 20);
+  assert.equal(f.video.paused, false); assert.equal(feedback.textContent, ''); assert.equal(feedback.classList.contains('is-visible'), false); assert.equal(toggles, 0);
+  await f.load(0, 2000); hit.emit('click', { clientX: 200 }); assert.deepEqual(seeks, [20, 1000]);
+  t.mock.timers.tick(120); await flush(); await f.ready();
+  await f.player.seek(2000); hit.emit('click', { clientX: 100 }); assert.deepEqual(seeks, [20, 1000, 0]);
+  t.mock.timers.tick(120); await flush(); await f.ready();
+  assert.equal(f.player.getTime(), 0); assert.equal(f.video.paused, false); assert.deepEqual(seeks, [20, 1000, 0]);
 });
