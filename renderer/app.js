@@ -192,6 +192,7 @@ export function createApp({ player, timelineView, ytcut, document: doc, youtubeF
         if (!reusable) {
           const options = {
             onTime: sec => { if (ownsPlayer(load, owner)) onTime(sec); },
+            onSeek: sec => { if (ownsPlayer(load, owner)) onSeek(sec); },
             onError: error => { if (ownsPlayer(load, owner)) void handlePlayerFailure(load, owner, error); },
             onBuffering: value => { if (ownsPlayer(load, owner)) { buffering = value; renderLoading(); } },
             prepare: async videoId => {
