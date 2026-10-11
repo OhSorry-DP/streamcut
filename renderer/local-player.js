@@ -97,17 +97,57 @@ function covering(ranges, time) {
   return -1;
 }
 
-export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuffering, onSeek } = {}) {
+export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuffering, onSeek, audioState = { volume: 1, muted: false } } = {}) {
   const container = document.getElementById(containerId), video = document.createElement('video');
+  audioState.volume = Number.isFinite(audioState.volume) ? Math.min(1, Math.max(0, audioState.volume)) : 1;
+  audioState.muted = audioState.muted === true;
   video.className = 'local-player'; video.playsInline = true; video.preload = 'auto';
   const shell = document.createElement('div'); shell.className = 'local-player-shell';
+  shell.tabIndex = -1;
   const feedback = document.createElement('span'); feedback.className = 'local-player-feedback'; feedback.setAttribute('aria-hidden', 'true');
   const hud = document.createElement('div'); hud.className = 'local-player-hud';
   const timeDisplay = document.createElement('span'); timeDisplay.className = 'local-player-time'; timeDisplay.setAttribute('aria-label', '재생 시간');
   const progress = document.createElement('progress'); progress.className = 'local-player-progress'; progress.setAttribute('aria-label', '재생 위치');
   const progressHit = document.createElement('div'); progressHit.className = 'local-player-progress-hit';
+  const audioControls = document.createElement('div'); audioControls.className = 'local-player-audio-controls'; audioControls.tabIndex = -1;
+  const muteButton = document.createElement('button'); muteButton.className = 'local-player-mute'; muteButton.type = 'button'; muteButton.tabIndex = -1;
+  const volumeInput = document.createElement('input'); volumeInput.className = 'local-player-volume'; volumeInput.type = 'range'; volumeInput.min = '0'; volumeInput.max = '1'; volumeInput.step = '0.01'; volumeInput.tabIndex = -1; volumeInput.setAttribute('aria-label', '음량');
+  audioControls.replaceChildren(muteButton, volumeInput);
   progress.max = 1; progress.value = 0; timeDisplay.textContent = '0:00 / 0:00'; feedback.textContent = '';
-  progressHit.replaceChildren(progress); hud.replaceChildren(timeDisplay, progressHit); shell.replaceChildren(video, feedback, hud); container.replaceChildren(shell);
+  progressHit.replaceChildren(progress); hud.replaceChildren(timeDisplay, progressHit, audioControls); shell.replaceChildren(video, feedback, hud); container.replaceChildren(shell);
+  function applyAudio() {
+    const isMuted = audioState.muted || audioState.volume === 0;
+    video.volume = audioState.volume; video.muted = audioState.muted;
+    volumeInput.value = String(audioState.volume); volumeInput.setAttribute('aria-valuetext', `${Math.round(audioState.volume * 100)}%`);
+    muteButton.textContent = isMuted ? '🔇' : '🔊';
+    muteButton.setAttribute('aria-label', isMuted ? '음소거 해제' : '음소거'); muteButton.setAttribute('title', isMuted ? '음소거 해제' : '음소거');
+    muteButton.setAttribute('aria-pressed', String(isMuted));
+  }
+  function focusShell() { shell.focus({ preventScroll: true }); }
+  const controlListeners = [];
+  function controlListen(node, name, handler) { node.addEventListener(name, handler); controlListeners.push([node, name, handler]); }
+  controlListen(muteButton, 'focus', focusShell);
+  controlListen(volumeInput, 'focus', focusShell);
+  const stopControlPointer = event => event.stopPropagation();
+  for (const node of [muteButton, volumeInput]) {
+    controlListen(node, 'pointerdown', stopControlPointer);
+    controlListen(node, 'click', event => { event.stopPropagation(); if (node === muteButton) {
+      const prevented = event.defaultPrevented, button = event.button;
+      if (button !== 0 || prevented || destroyed) return;
+      event.preventDefault(); api.toggleMute();
+    } focusShell(); });
+  }
+  controlListen(volumeInput, 'input', event => {
+    event.stopPropagation();
+    if (!destroyed) {
+      const value = Number(volumeInput.value);
+      if (Number.isFinite(value)) { audioState.volume = Math.min(1, Math.max(0, value)); audioState.muted = false; }
+      applyAudio();
+    }
+    focusShell();
+  });
+  controlListen(volumeInput, 'change', () => { if (!destroyed) applyAudio(); });
+  applyAudio();
   let destroyed = false, generation = 0, streamGeneration = 0, prepareGeneration = 0, stream;
   let duration = 0, videoId, path, wantPlay = false, ended = false, retried = false, failed = false, lastRecoverAt = 0;
   let preparing = false, target, pendingTarget, seekTimer, bufferingTimer, prepareTimer, feedbackTimer, buffering = false, loadWait, targetRevision = 0, requestId = 0;
@@ -525,6 +565,12 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
       if (Number.isFinite(duration) && duration > 0 && !failed && !ended) showFeedback(isPausing);
       if (isPausing) await api.pause(); else { wantPlay = true; await play(); }
     },
+    toggleMute() {
+      if (destroyed) return;
+      if (audioState.volume === 0) { audioState.volume = 1; audioState.muted = false; }
+      else audioState.muted = !audioState.muted;
+      applyAudio();
+    },
     getTime,
     destroy() {
       if (destroyed) return;
@@ -532,9 +578,11 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
       target = pendingTarget = undefined; clearInterval(pollTimer);
       for (const [name, fn] of Object.entries(listeners)) video.removeEventListener(name, fn);
       progressHit.removeEventListener('click', onProgressClick);
+      for (const [node, name, fn] of controlListeners) node.removeEventListener(name, fn);
       video.pause(); video.removeAttribute('src'); video.load(); container.replaceChildren();
     },
   };
+  applyAudio();
   renderPlayback();
   return api;
 }

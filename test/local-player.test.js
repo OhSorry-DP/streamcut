@@ -87,6 +87,7 @@ class FakeNode extends Events {
     this.attributes = new Map();
     this.value = 0;
     this.max = 0;
+    this.tabIndex = 0;
     const tokens = () => this.className.split(/\s+/).filter(Boolean);
     this.classList = {
       add: (...names) => { this.className = [...new Set([...tokens(), ...names])].join(' '); },
@@ -96,6 +97,7 @@ class FakeNode extends Events {
   }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; }
+  focus(options) { this.focusOptions = options; globalThis.document.activeElement = this; this.emit('focus', { bubbles: false }); }
   removeAttribute(name) { this.attributes.delete(name); }
   replaceChildren(...nodes) {
     for (const child of this.children) child.parentNode = null;
@@ -104,7 +106,7 @@ class FakeNode extends Events {
   }
 }
 class FakeVideo extends FakeNode {
-  _currentTime = 0; paused = true; src = ''; currentSrc = ''; sources = []; ranges = []; readyState = 0; seeking = false;
+  _currentTime = 0; volume = 1; muted = false; paused = true; src = ''; currentSrc = ''; sources = []; ranges = []; readyState = 0; seeking = false;
   delayedSeek = false; throwBeforeMetadata = false; assignments = []; playCalls = 0; rejectPlay = false;
   buffered = rangesOf(this);
   constructor() { super('video'); }
@@ -196,6 +198,7 @@ function fixture(t, options = {}) {
   URL.createObjectURL = () => { log.push(['createObjectURL']); const url = `blob:test/${sources.length}`; live.add(url); return url; };
   URL.revokeObjectURL = url => { assert.equal(live.delete(url), true); revoked.push(url); };
   globalThis.document = {
+    activeElement: null,
     getElementById: () => container,
     createElement: tag => {
       if (tag === 'video') return video;
@@ -230,7 +233,7 @@ function fixture(t, options = {}) {
   };
   const player = createLocalPlayer('player', {
     prepare: async id => { prepareCalls++; return options.prepare ? options.prepare(id, prepareCalls) : { path: `/preview/token${prepareCalls === 1 ? '' : prepareCalls}.mp4` }; },
-    onError: error => errors.push(error), onTime: time => times.push(time), onBuffering: value => buffering.push(value), onSeek: options.onSeek,
+    onError: error => errors.push(error), onTime: time => times.push(time), onBuffering: value => buffering.push(value), onSeek: options.onSeek, audioState: options.audioState,
   });
   t.after(() => {
     player.destroy(); assert.equal(live.size, 0);
@@ -787,7 +790,15 @@ test('local player renders its DOM and formats playback time across hour boundar
   assert.deepEqual(shell.children, [f.video, feedback, hud]);
   assert.deepEqual(f.container.children, [shell]);
   const hit = f.find('local-player-progress-hit');
-  assert.deepEqual(hud.children, [time, hit]);
+  const audio = f.find('local-player-audio-controls');
+  assert.deepEqual(hud.children, [time, hit, audio]);
+  const mute = f.find('local-player-mute'), volume = f.find('local-player-volume');
+  assert.deepEqual(audio.children, [mute, volume]);
+  assert.equal(mute.type, 'button'); assert.equal(mute.tabIndex, -1); assert.equal(mute.textContent, '🔊');
+  assert.equal(mute.getAttribute('aria-label'), '음소거'); assert.equal(mute.getAttribute('title'), '음소거'); assert.equal(mute.getAttribute('aria-pressed'), 'false');
+  assert.equal(volume.type, 'range'); assert.equal(volume.value, '1'); assert.equal(volume.min, '0'); assert.equal(volume.max, '1'); assert.equal(volume.step, '0.01');
+  assert.equal(volume.getAttribute('aria-label'), '음량'); assert.equal(volume.getAttribute('aria-valuetext'), '100%');
+  assert.equal(f.video.volume, 1); assert.equal(f.video.muted, false);
   assert.deepEqual(hit.children, [progress]);
   assert.equal(feedback.getAttribute('aria-hidden'), 'true');
   assert.equal(time.getAttribute('aria-label'), '재생 시간');
@@ -1034,4 +1045,69 @@ test('끝 경계 seek는 timer를 해제하고 재생 시도 뒤 캐시 seek로 
   assert.notEqual(f.buffering.at(-1), true); assert.deepEqual(f.errors, []);
   const back = f.player.seekAndPlay(1.9); t.mock.timers.tick(120); await back; await flush();
   assert.equal(f.player.getTime(), 1.9); assert.equal(f.video.paused, false);
+});
+
+test('local audio mute button toggles mute without changing volume or playback', async t => {
+  const state = { volume: 0.35, muted: false }, seeks = [], f = fixture(t, { audioState: state, onSeek: sec => seeks.push(sec) });
+  const button = f.find('local-player-mute'), playCalls = f.video.playCalls, time = f.find('local-player-time').textContent;
+  const feedback = f.find('local-player-feedback'), feedbackText = feedback.textContent, feedbackVisible = feedback.classList.contains('is-visible');
+  const validClick = button.emit('click'); assert.equal(validClick.defaultPrevented, true); assert.deepEqual(state, { volume: 0.35, muted: true });
+  assert.equal(f.video.volume, 0.35); assert.equal(f.video.muted, true); assert.equal(button.textContent, '🔇');
+  assert.equal(button.getAttribute('aria-pressed'), 'true'); assert.equal(button.getAttribute('aria-label'), '음소거 해제'); assert.equal(button.getAttribute('title'), '음소거 해제');
+  button.emit('click'); assert.equal(state.muted, false); assert.equal(button.textContent, '🔊');
+  button.emit('click', { button: 2 }); assert.equal(state.muted, false);
+  button.emit('click', { defaultPrevented: true }); assert.equal(state.muted, false);
+  state.volume = 0; state.muted = false; f.player.toggleMute(); assert.deepEqual(state, { volume: 1, muted: false });
+  assert.equal(f.video.playCalls, playCalls); assert.deepEqual(seeks, []); assert.equal(f.find('local-player-time').textContent, time);
+  assert.equal(feedback.textContent, feedbackText); assert.equal(feedback.classList.contains('is-visible'), feedbackVisible);
+});
+
+test('local audio range input clamps values and restores invalid input', async t => {
+  const f = fixture(t, { audioState: { volume: 0.8, muted: true } }), range = f.find('local-player-volume'), button = f.find('local-player-mute');
+  for (const [value, volume, glyph, text] of [['0.35', 0.35, '🔊', '35%'], ['0', 0, '🔇', '0%'], ['1', 1, '🔊', '100%']]) {
+    range.value = value; range.emit('input'); assert.equal(f.video.volume, volume); assert.equal(f.video.muted, false);
+    assert.equal(button.textContent, glyph); assert.equal(range.getAttribute('aria-valuetext'), text);
+  }
+  const before = [f.video.volume, f.video.muted, range.value, button.textContent];
+  range.value = 'NaN'; range.emit('input'); assert.deepEqual([f.video.volume, f.video.muted, range.value, button.textContent], before);
+  for (const [value, expected] of [['-1', 0], ['2', 1]]) { range.value = value; range.emit('input'); assert.equal(f.video.volume, expected); }
+});
+
+test('local audio controls isolate events and return focus to the shell', async t => {
+  const seeks = [], f = fixture(t, { onSeek: sec => seeks.push(sec) });
+  const shell = f.find('local-player-shell'), hud = f.find('local-player-hud'), button = f.find('local-player-mute'), range = f.find('local-player-volume');
+  let shellClicks = 0, hudClicks = 0, toggles = 0;
+  shell.addEventListener('click', () => shellClicks++); hud.addEventListener('click', () => hudClicks++);
+  const original = f.player.togglePlay; t.mock.method(f.player, 'togglePlay', function (...args) { toggles++; return original.apply(this, args); });
+  button.emit('pointerdown'); button.emit('click'); range.value = '0.4'; const pointer = range.emit('pointerdown'); range.emit('input'); range.emit('click');
+  assert.equal(pointer.defaultPrevented, false); assert.equal(shellClicks, 0); assert.equal(hudClicks, 0);
+  assert.deepEqual(seeks, []); assert.equal(toggles, 0);
+  button.emit('focus'); assert.equal(globalThis.document.activeElement, shell); assert.equal(shell.focusOptions.preventScroll, true);
+  range.emit('focus'); assert.equal(globalThis.document.activeElement, shell); assert.equal(shell.tabIndex, -1);
+  assert.equal(button.tabIndex, -1); assert.equal(range.tabIndex, -1);
+  button.emit('click'); range.value = '0.5'; range.emit('input'); assert.equal(globalThis.document.activeElement, shell);
+});
+
+test('local audio state reference survives reload and player recreation', async t => {
+  const state = { volume: 0.35, muted: true }, f = fixture(t, { audioState: state });
+  assert.equal(f.video.volume, 0.35); assert.equal(f.video.muted, true);
+  await f.load(10); await f.load(20); assert.equal(f.video.volume, 0.35); assert.equal(f.video.muted, true);
+  const range = f.find('local-player-volume'); range.value = '0.6'; range.emit('input'); assert.equal(state.volume, 0.6); assert.equal(state.muted, false);
+  f.player.destroy();
+  const player = createLocalPlayer('player', { audioState: state, prepare: async () => ({ path: '/preview/recreated.mp4' }) });
+  assert.equal(f.video.volume, 0.6); assert.equal(f.video.muted, false); player.destroy();
+});
+
+test('destroy removes local audio listeners and prevents state changes', async t => {
+  const state = { volume: NaN, muted: 'yes' }, f = fixture(t, { audioState: state });
+  assert.deepEqual(state, { volume: 1, muted: false }); assert.equal(f.video.volume, 1); assert.equal(f.video.muted, false);
+  const button = f.find('local-player-mute'), range = f.find('local-player-volume'), snapshot = { ...state };
+  assert.ok(button.listeners.size > 0); assert.ok(range.listeners.size > 0);
+  f.player.destroy(); assert.equal(button.listeners.size, 0); assert.equal(range.listeners.size, 0);
+  f.player.toggleMute(); button.emit('click'); range.value = '0'; range.emit('input'); assert.deepEqual(state, snapshot);
+  assert.equal(f.video.listeners.size, 0); assert.deepEqual(f.container.children, []);
+  const silent = { volume: 0, muted: false }, player = createLocalPlayer('player', { audioState: silent });
+  const silentButton = f.nodes.filter(node => node.classList.contains('local-player-mute')).at(-1);
+  assert.equal(silentButton.textContent, '🔇'); assert.equal(silentButton.getAttribute('aria-pressed'), 'true');
+  player.toggleMute(); assert.deepEqual(silent, { volume: 1, muted: false }); player.destroy();
 });
