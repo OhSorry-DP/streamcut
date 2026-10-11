@@ -1539,14 +1539,14 @@ async function previewFixture(t, options = {}) {
     async saveSettings(value) { return { ok: true, value }; },
   };
   const factory = (kind, list) => (id, callbacks) => {
-    const record = { callbacks, destroyed: 0, loads: [] }; list.push(record);
+    const record = { callbacks, destroyed: 0, loads: [], seeks: [], pauses: [], seekAndPlays: [] }; list.push(record);
     if (options[`${kind}Throw`]) throw new Error('factory failed');
     return record.player = {
       destroy() { record.destroyed++; }, async load(...args) {
         record.loads.push(args);
         if (kind === 'local') await callbacks.prepare(args[0].videoId);
         if (options[`${kind}Load`]) await options[`${kind}Load`](record);
-      }, async pause() {}, async seek() {}, async seekAndPlay() {}, getTime() { return 12; },
+      }, async pause() { record.pauses.push(true); }, async seek(sec) { record.seeks.push(sec); }, async seekAndPlay(sec) { record.seekAndPlays.push(sec); }, getTime() { return 12; },
     };
   };
   const app = createApp({ document: doc, ytcut, timelineView: { set() {}, destroy() {} }, youtubeFactory: factory('youtube', youtube), localFactory: factory('local', local) });
@@ -1554,6 +1554,65 @@ async function previewFixture(t, options = {}) {
   if (!options.bootstrap) await app.bootstrapped;
   return { app, doc, ytcut, local, youtube, caps, label, push: value => push(value), node: id => doc.getElementById(id) };
 }
+
+test('P app timeline seek callback uses the existing seek and playback path', async t => {
+  const f = await previewFixture(t);
+  await f.app.edit(snapshot().video); await until(() => f.node('loading-overlay').hidden);
+  const timeline = f.app.getState().timeline;
+  f.app.onChange({ ...timeline, startSec: 5, endSec: 30, zoom: 4, scrollSec: 10 });
+  f.local[0].callbacks.onSeek(40);
+  assert.deepEqual(f.local[0].seekAndPlays, [40]);
+  assert.deepEqual(f.app.getState().timeline, { ...f.app.getState().timeline, startSec: 5, endSec: 30, zoom: 4, scrollSec: 10, playheadSec: 40 });
+  f.app.onSeek(45);
+  assert.deepEqual(f.local[0].seekAndPlays, [40, 45]); assert.equal(f.app.getState().timeline.playheadSec, 45);
+  f.local[0].callbacks.onSeek(80);
+  assert.deepEqual(f.local[0].seekAndPlays, [40, 45, 80]); assert.equal(f.app.getState().timeline.playheadSec, 60);
+});
+
+test('P seeking during segment preview clears preview mode', async t => {
+  const f = await previewFixture(t);
+  await f.app.edit(snapshot().video); await until(() => f.node('loading-overlay').hidden);
+  f.app.onChange({ ...f.app.getState().timeline, startSec: 5, endSec: 30 });
+  await f.node('preview-button').emit('click'); assert.deepEqual(f.local[0].seekAndPlays, [5]);
+  f.local[0].callbacks.onSeek(40); assert.deepEqual(f.local[0].seekAndPlays, [5, 40]);
+  f.local[0].callbacks.onTime(45); assert.equal(f.app.getState().timeline.playheadSec, 45);
+  assert.deepEqual(f.local[0].pauses, []); assert.deepEqual(f.local[0].seeks, []);
+});
+
+test('P app ignores preview seek callbacks during preparation, after replacement and after dispose', async t => {
+  const pending = deferredPreview(), f = await previewFixture(t, { prepare: pending.promise });
+  const editing = f.app.edit(snapshot().video); await until(() => f.local.length === 1);
+  const beforePreparingCallback = f.app.getState();
+  f.local[0].callbacks.onSeek(40);
+  assert.deepEqual(f.local[0].seekAndPlays, []); assert.deepEqual(f.app.getState(), beforePreparingCallback);
+  pending.resolve({ ok: true, value: { path: '/preview/token.mp4' } });
+  await editing; await until(() => f.node('loading-overlay').hidden);
+  f.local[0].callbacks.onSeek(40); assert.deepEqual(f.local[0].seekAndPlays, [40]);
+  const old = f.local[0];
+  await f.app.edit({ ...snapshot().video, videoId: 'lmnopqrstuv' });
+  await until(() => f.local.length === 2 && f.node('loading-overlay').hidden);
+  const beforeOld = f.app.getState();
+  old.callbacks.onSeek(55);
+  assert.deepEqual(f.app.getState(), beforeOld); assert.deepEqual(old.seekAndPlays, [40]); assert.deepEqual(f.local[1].seekAndPlays, []);
+  f.local[1].callbacks.onSeek(25); assert.deepEqual(f.local[1].seekAndPlays, [25]);
+  f.app.dispose(); const beforeDisposeCallback = f.app.getState();
+  f.local[1].callbacks.onSeek(50);
+  assert.deepEqual(f.app.getState(), beforeDisposeCallback); assert.deepEqual(f.local[1].seekAndPlays, [25]);
+});
+
+test('P current preview seek owner reports playback errors and failed owner callbacks stay inert', async t => {
+  const f = await previewFixture(t);
+  await f.app.edit(snapshot().video); await until(() => f.node('loading-overlay').hidden);
+  const failed = f.local[0];
+  t.mock.method(failed.player, 'seekAndPlay', async () => { throw new Error('탐색 테스트 오류'); });
+  failed.callbacks.onSeek(20); await Promise.resolve(); await Promise.resolve();
+  assert.equal(f.node('app-error').textContent, '탐색 테스트 오류');
+  failed.callbacks.onError(new Error('재생 실패'));
+  await until(() => f.youtube.length === 1 && f.node('loading-overlay').hidden);
+  const before = f.app.getState(); const localCalls = [...failed.seekAndPlays]; const youtubeCalls = [...f.youtube[0].seekAndPlays];
+  failed.callbacks.onSeek(35);
+  assert.deepEqual(f.app.getState(), before); assert.deepEqual(failed.seekAndPlays, localCalls); assert.deepEqual(f.youtube[0].seekAndPlays, youtubeCalls);
+});
 
 test('P default local mode never creates YouTube, freezes cap and queue restoration uses latest settings without snapshot fields', async t => {
   const f = await previewFixture(t);
