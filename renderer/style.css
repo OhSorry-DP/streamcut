@@ -86,6 +86,23 @@ h2 { font-size: 17px; }
   font-size: 12px; line-height: 18px; font-variant-numeric: tabular-nums;
   white-space: nowrap; flex: 0 0 auto; pointer-events: none;
 }
+.local-player-audio-controls {
+  display: flex; align-items: center; gap: 6px; flex: 0 0 auto; pointer-events: none;
+}
+.local-player-mute {
+  display: grid; place-items: center; width: 28px; height: 24px; padding: 0;
+  border: 0; border-radius: 4px; background: transparent; color: #fff;
+  font-size: 16px; line-height: 1; flex: 0 0 auto; pointer-events: auto; cursor: pointer;
+}
+.local-player-mute:hover:not(:disabled) { background: rgba(255, 255, 255, .15); }
+.local-player-volume {
+  width: 80px; min-width: 0; height: 24px; margin: 0; padding: 0; border: 0;
+  background: transparent; flex: 0 0 80px; accent-color: var(--accent);
+  pointer-events: auto; cursor: pointer;
+}
+@media (max-width: 480px) {
+  .local-player-volume { width: 56px; flex-basis: 56px; }
+}
 .local-player-progress-hit {
   display: flex; align-items: center; flex: 1 1 0; min-width: 0; height: 16px;
   pointer-events: auto; cursor: pointer;
