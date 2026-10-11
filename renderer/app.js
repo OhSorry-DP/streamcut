@@ -11,6 +11,7 @@ export function createApp({ player, timelineView, ytcut, document: doc, youtubeF
   const el = id => doc.getElementById(id);
   const copy = value => value == null ? value : structuredClone(value);
   let settings = { format: 'mp4', cutMode: 'accurate', autoUpdateYtDlp: true, autoUpdateFfmpeg: false, previewResolution: 480, alwaysUseLocalPlayer: true };
+  const localAudioState = { volume: 1, muted: false };
   let state = { video: null, timeline: { startSec: 0, endSec: 0 }, cutMode: 'accurate', format: 'mp4', fileName: '' };
   let generation = 0;
   let revision = -1;
@@ -200,7 +201,7 @@ export function createApp({ player, timelineView, ytcut, document: doc, youtubeF
               return unwrap(await ytcut.preparePreview(videoId, load.cap));
             },
           };
-          owner.player = (kind === 'local' ? localFactory : youtubeFactory)('player', options);
+          owner.player = (kind === 'local' ? localFactory : youtubeFactory)('player', kind === 'local' ? { ...options, audioState: localAudioState } : options);
           player = owner.player;
         }
         await owner.player.load(kind === 'local' ? copy(state.video) : state.video.videoId, state.timeline.playheadSec || 0);
@@ -781,6 +782,13 @@ export function createApp({ player, timelineView, ytcut, document: doc, youtubeF
     }
     if (!ready || textTarget(event.target) || event.altKey || event.metaKey || event.isComposing) return;
     const key = event.key?.toLowerCase();
+    if (key === 'm') {
+      if (!previewReady || typeof player.toggleMute !== 'function' || event.ctrlKey || event.shiftKey) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.type === 'keydown' && !event.repeat) Promise.resolve(player.toggleMute()).catch(message);
+      return;
+    }
     // 임베드가 막힌 영상(미리보기 불가)에서도 Space 는 가로채야 포커스된 버튼(예: 다운로드)이 눌려 중복 실행되지 않는다.
     // '[' 는 다운로드 버튼과 같다(미리보기 가능 여부와 무관, 버튼처럼 ready 만 필요).
     if (!space && key !== '[' && (!previewReady || !['arrowleft', 'arrowright', 'i', 'o', 'p'].includes(key))) return;

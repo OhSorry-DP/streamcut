@@ -611,7 +611,7 @@ test('same queue row replaces its request and URL load has no loading queue row'
   await f.metadata(2); f.loads[1].resolve(); await f.settle(); f.assertLoading(null, false);
 });
 
-async function keyboardFixture(t, loaded = true, previewLoaded = true) {
+async function keyboardFixture(t, loaded = true, previewLoaded = true, options = {}) {
   const doc = rendererDocument();
   const handlers = new Map();
   doc.addEventListener = (type, fn, capture) => { assert.equal(capture, true); handlers.set(type, fn); };
@@ -631,13 +631,16 @@ async function keyboardFixture(t, loaded = true, previewLoaded = true) {
   const seeks = [], toggles = [], previews = [], pauses = [];
   let resolveLoad;
   const view = createTimelineView(root, { onChange: state => app.onChange(state), onSeek: sec => app.onSeek(sec) });
+  const localMuteCalls = [];
   app = createApp({ document: doc, timelineView: view,
     player: { async load() { if (!previewLoaded) await new Promise(resolve => { resolveLoad = resolve; }); }, getTime: () => time,
       async seekAndPlay(sec) { time = sec; playing = true; previews.push(['seek', sec], 'play'); },
       async pause() { playing = false; pauses.push('pause'); },
       async seek(sec) { time = sec; seeks.push(sec); },
       async togglePlay() { playing = !playing; toggles.push(playing); }, destroy() {} },
-    ytcut: { onQueueChanged() {}, async bootstrap() { return { ok: true, value: { settings: { alwaysUseLocalPlayer: false } } }; },
+    localFactory: options.local ? (id, callbacks) => ({ async load(video) { await callbacks.prepare(video.videoId); if (!previewLoaded) await new Promise(resolve => { resolveLoad = resolve; }); }, async destroy() {}, async pause() {}, async seek() {}, async seekAndPlay() {}, getTime: () => time,
+      ...(options.localMute ? { toggleMute() { localMuteCalls.push(true); } } : {}) }) : undefined,
+    ytcut: { onQueueChanged() {}, async preparePreview() { return { ok: true, value: { path: '/preview/test.mp4' } }; }, async bootstrap() { return { ok: true, value: { settings: { alwaysUseLocalPlayer: !!options.local } } }; },
       async metadata(input) { return { ok: true, value: { requestId: input.requestId, video: snapshot().video } }; },
       async add() { adds++; return { ok: true, value: {} }; } },
   });
@@ -649,12 +652,13 @@ async function keyboardFixture(t, loaded = true, previewLoaded = true) {
     const event = { type, key, target, preventDefault() { this.defaultPrevented = true; },
       stopPropagation() { this.stopped = true; }, ...props };
     handlers.get(type)?.(event);
+    if (!event.defaultPrevented && target.type === 'range' && key.startsWith('Arrow')) target.value = String(Number(target.value || 0.5) + (key === 'ArrowLeft' ? -0.01 : 0.01));
     // Model the native focused button/summary/range Space activation.
     if (!event.defaultPrevented && key === ' ' && type === 'keyup') await target.emit('click');
     await Promise.resolve();
     return event;
   };
-  return { doc, app, view, key, seeks, toggles, previews, pauses, resolveLoad: () => resolveLoad?.(), setTime: value => { time = value; },
+  return { doc, app, view, key, seeks, toggles, previews, pauses, handlers, localMuteCalls, resolveLoad: () => resolveLoad?.(), setTime: value => { time = value; },
     get adds() { return adds; } };
 }
 
@@ -708,6 +712,83 @@ test('P ignores text targets, modifiers, repeats, unloaded video and unavailable
   await pending.key('p'); await pending.doc.getElementById('preview-button').emit('click');
   assert.deepEqual(pending.previews, []);
   pending.resolveLoad(); await Promise.resolve(); await Promise.resolve();
+});
+
+test('M toggles local mute once per unmodified key press and registers capture handlers', async t => {
+  const f = await keyboardFixture(t, true, true, { local: true, localMute: true });
+  await until(() => f.doc.getElementById('loading-overlay').hidden && f.doc.getElementById('preview-button').disabled === false);
+  assert.equal(f.handlers.has('keydown'), true); assert.equal(f.handlers.has('keyup'), true);
+  for (const key of ['M', 'm']) {
+    const down = await f.key(key); assert.equal(down.defaultPrevented, true); assert.equal(down.stopped, true);
+    const repeat = await f.key(key, { repeat: true }); assert.equal(repeat.defaultPrevented, true); assert.equal(repeat.stopped, true);
+    const up = await f.key(key, {}, 'keyup'); assert.equal(up.defaultPrevented, true); assert.equal(up.stopped, true);
+  }
+  assert.equal(f.localMuteCalls.length, 2);
+});
+
+test('M leaves excluded targets, modifiers, dialogs and unavailable players untouched', async t => {
+  const f = await keyboardFixture(t, true, true, { local: true, localMute: true });
+  await until(() => f.doc.getElementById('preview-button').disabled === false);
+  const targets = [{ tagName: 'INPUT', type: 'text' }, { tagName: 'TEXTAREA' }, { tagName: 'SELECT' },
+    { isContentEditable: true }, { tagName: 'SPAN', closest: selector => selector.includes('contenteditable') ? {} : null }];
+  for (const target of targets) for (const type of ['keydown', 'keyup']) {
+    const event = await f.key('m', { target }, type); assert.equal(event.defaultPrevented, undefined); assert.equal(event.stopped, undefined);
+  }
+  for (const props of [{ ctrlKey: true }, { shiftKey: true }, { altKey: true }, { metaKey: true }, { isComposing: true }]) {
+    for (const type of ['keydown', 'keyup']) {
+      const event = await f.key('m', props, type); assert.equal(event.defaultPrevented, undefined); assert.equal(event.stopped, undefined);
+    }
+  }
+  await f.doc.getElementById('settings-button').emit('click');
+  for (const type of ['keydown', 'keyup']) {
+    const event = await f.key('m', {}, type); assert.equal(event.defaultPrevented, undefined); assert.equal(event.stopped, undefined);
+  }
+  const pending = await keyboardFixture(t, true, false, { local: true, localMute: true });
+  for (const type of ['keydown', 'keyup']) {
+    const event = await pending.key('m', {}, type); assert.equal(event.defaultPrevented, undefined); assert.equal(event.stopped, undefined);
+  }
+  pending.resolveLoad(); await Promise.resolve(); await Promise.resolve();
+  const unloaded = await keyboardFixture(t, false, true, { local: true, localMute: true });
+  for (const type of ['keydown', 'keyup']) {
+    const event = await unloaded.key('m', {}, type); assert.equal(event.defaultPrevented, undefined); assert.equal(event.stopped, undefined);
+  }
+  const basic = await keyboardFixture(t);
+  for (const type of ['keydown', 'keyup']) {
+    const event = await basic.key('m', {}, type); assert.equal(event.defaultPrevented, undefined); assert.equal(event.stopped, undefined);
+  }
+  assert.equal(f.localMuteCalls.length, 0); assert.equal(pending.localMuteCalls.length, 0); assert.equal(unloaded.localMuteCalls.length, 0);
+});
+
+test('range focus keeps Space and seek shortcuts from changing native volume', async t => {
+  const f = await keyboardFixture(t), range = { tagName: 'INPUT', type: 'range', value: '0.5', async emit() {} };
+  const before = range.value;
+  const down = await f.key(' ', { target: range });
+  const repeat = await f.key(' ', { target: range, repeat: true });
+  const up = await f.key(' ', { target: range }, 'keyup');
+  assert.equal(down.defaultPrevented, true); assert.equal(repeat.defaultPrevented, true); assert.equal(up.defaultPrevented, true);
+  assert.equal((await f.key('ArrowLeft', { target: range })).defaultPrevented, true);
+  assert.equal((await f.key('ArrowRight', { target: range })).defaultPrevented, true);
+  assert.equal((await f.key('ArrowLeft', { target: range, ctrlKey: true })).defaultPrevented, true);
+  assert.equal((await f.key('ArrowRight', { target: range, ctrlKey: true })).defaultPrevented, true);
+  assert.equal((await f.key('ArrowRight', { target: range, shiftKey: true })).defaultPrevented, true);
+  assert.equal((await f.key('ArrowLeft', { target: range, shiftKey: true })).defaultPrevented, true);
+  assert.equal((await f.key('ArrowRight', { target: range, shiftKey: true, ctrlKey: true })).defaultPrevented, true);
+  assert.equal(range.value, before);
+  assert.equal(f.seeks.length, 7); assert.equal(f.toggles.length, 1);
+  assert.deepEqual(f.seeks, [10, 20, 19, 20, 60, 0, 1]);
+});
+
+test('range focus preserves I/O/P/[ and timeline seek behavior', async t => {
+  const f = await keyboardFixture(t), range = { tagName: 'INPUT', type: 'range', value: '0.4' };
+  f.app.onChange({ ...f.app.getState().timeline, startSec: 10, endSec: 40 });
+  f.setTime(20); assert.equal((await f.key('I', { target: range })).defaultPrevented, true);
+  assert.equal(f.app.getState().timeline.startSec, 20);
+  f.setTime(30); assert.equal((await f.key('O', { target: range })).defaultPrevented, true);
+  assert.equal(f.app.getState().timeline.endSec, 30);
+  assert.equal((await f.key('P', { target: range })).defaultPrevented, true);
+  assert.deepEqual(f.previews, [['seek', 20], 'play']);
+  assert.equal((await f.key('[', { target: range })).defaultPrevented, true); assert.equal(f.adds, 1);
+  f.app.onSeek(25); assert.deepEqual(f.previews, [['seek', 20], 'play', ['seek', 25], 'play']);
 });
 
 test('queue status shows percent, seconds, minutes, unknown ETA and processing; restored range previews', async t => {
@@ -1528,7 +1609,7 @@ function deferredPreview() {
   return { promise, resolve, reject };
 }
 async function previewFixture(t, options = {}) {
-  const doc = rendererDocument(), local = [], youtube = [], caps = [];
+  const doc = rendererDocument(), local = [], youtube = [], caps = [], savedSettings = [];
   const label = new RendererNode(); doc.getElementById('loading-overlay').querySelector = () => label;
   let push;
   const ytcut = {
@@ -1536,7 +1617,7 @@ async function previewFixture(t, options = {}) {
     bootstrap: () => options.bootstrap || Promise.resolve({ ok: true, value: { settings: options.settings || {} } }),
     async metadata({ requestId }) { return options.metadataFailure ? { ok: false, error: new Error('metadata failed') } : { ok: true, value: { requestId, video: snapshot().video } }; },
     async preparePreview(videoId, cap) { caps.push(cap); return options.prepare || { ok: true, value: { path: '/preview/token.mp4' } }; },
-    async saveSettings(value) { return { ok: true, value }; },
+    async saveSettings(value) { savedSettings.push(value); return { ok: true, value }; },
   };
   const factory = (kind, list) => (id, callbacks) => {
     const record = { callbacks, destroyed: 0, loads: [], seeks: [], pauses: [], seekAndPlays: [] }; list.push(record);
@@ -1552,8 +1633,41 @@ async function previewFixture(t, options = {}) {
   const app = createApp({ document: doc, ytcut, timelineView: { set() {}, destroy() {} }, youtubeFactory: factory('youtube', youtube), localFactory: factory('local', local) });
   t.after(() => app.dispose());
   if (!options.bootstrap) await app.bootstrapped;
-  return { app, doc, ytcut, local, youtube, caps, label, push: value => push(value), node: id => doc.getElementById(id) };
+  return { app, doc, ytcut, local, youtube, caps, label, savedSettings, push: value => push(value), node: id => doc.getElementById(id) };
 }
+
+test('local audio state survives edit recreation and stays out of settings', async t => {
+  const f = await previewFixture(t);
+  await f.app.edit(snapshot().video); await until(() => f.node('loading-overlay').hidden);
+  const audioState = f.local[0].callbacks.audioState;
+  assert.deepEqual({ volume: audioState.volume, muted: audioState.muted }, { volume: 1, muted: false });
+  audioState.volume = 0.35; audioState.muted = true;
+  await f.app.edit({ ...snapshot().video, videoId: 'lmnopqrstuv', url: 'https://www.youtube.com/watch?v=lmnopqrstuv' });
+  await until(() => f.local.length === 2 && f.node('loading-overlay').hidden);
+  assert.equal(f.local[1].callbacks.audioState, audioState);
+  assert.deepEqual({ volume: audioState.volume, muted: audioState.muted }, { volume: 0.35, muted: true });
+  await f.node('settings-button').emit('click');
+  await f.node('settings-form').emit('submit');
+  assert.ok(f.savedSettings.length);
+  assert.equal(f.savedSettings.some(value => 'audioState' in value || 'volume' in value || 'muted' in value), false);
+});
+
+test('local audio state survives fallback and a separate app starts at defaults', async t => {
+  const first = await previewFixture(t);
+  await first.app.edit(snapshot().video); await until(() => first.node('loading-overlay').hidden);
+  const audioState = first.local[0].callbacks.audioState;
+  audioState.volume = 0.35; audioState.muted = true;
+  first.local[0].callbacks.onError(new Error('local failed'));
+  await until(() => first.youtube.length === 1 && first.node('loading-overlay').hidden);
+  assert.equal('audioState' in first.youtube[0].callbacks, false);
+  await first.app.edit({ ...snapshot().video, videoId: 'lmnopqrstuv', url: 'https://www.youtube.com/watch?v=lmnopqrstuv' });
+  await until(() => first.local.length === 2 && first.node('loading-overlay').hidden);
+  assert.equal(first.local[1].callbacks.audioState, audioState);
+  assert.deepEqual({ volume: audioState.volume, muted: audioState.muted }, { volume: 0.35, muted: true });
+  const second = await previewFixture(t);
+  await second.app.edit(snapshot().video); await until(() => second.node('loading-overlay').hidden);
+  assert.deepEqual({ volume: second.local[0].callbacks.audioState.volume, muted: second.local[0].callbacks.audioState.muted }, { volume: 1, muted: false });
+});
 
 test('P app timeline seek callback uses the existing seek and playback path', async t => {
   const f = await previewFixture(t);
