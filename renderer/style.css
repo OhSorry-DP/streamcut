@@ -74,13 +74,13 @@ h2 { font-size: 17px; }
   position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
   z-index: 2; pointer-events: none; opacity: 0; transition: opacity 180ms ease-out;
   font-size: 48px; line-height: 1; padding: 16px; border-radius: 50%;
-  color: var(--text); background: rgba(0, 0, 0, .55);
+  color: #fff; background: rgba(0, 0, 0, .55);
 }
 .local-player-feedback.is-visible { opacity: 1; }
 .local-player-hud {
   position: absolute; inset-inline: 0; bottom: 0; z-index: 1; pointer-events: none;
   display: flex; align-items: center; gap: 10px; padding: 8px 12px;
-  background: rgba(0, 0, 0, .65);
+  color: #fff; background: rgba(0, 0, 0, .65);
 }
 .local-player-time {
   font-size: 12px; line-height: 18px; font-variant-numeric: tabular-nums;
