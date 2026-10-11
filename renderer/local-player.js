@@ -1,4 +1,7 @@
+import { formatTime } from '../lib/time.js';
+
 const POLL_MS = 250, SEEK_MS = 120, BUFFERING_DELAY_MS = 250, LOAD_TIMEOUT_MS = 15000, RECOVER_COOLDOWN_MS = 15000;
+const FEEDBACK_HOLD_MS = 450;
 const FRONT_BUFFER_SEC = 180, RESUME_FRONT_SEC = 170;
 const MAX_RANGES = 4, MAX_BUFFERED_SEC = 720, EVICT_BLOCK_SEC = 60, PROTECT_BACK_SEC = 60, PROTECT_FRONT_SEC = 10;
 const INIT_LIMIT = 1024 * 1024, SLICE_SIZE = 256 * 1024;
@@ -96,10 +99,16 @@ function covering(ranges, time) {
 export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuffering } = {}) {
   const container = document.getElementById(containerId), video = document.createElement('video');
   video.className = 'local-player'; video.playsInline = true; video.preload = 'auto';
-  container.replaceChildren(video);
+  const shell = document.createElement('div'); shell.className = 'local-player-shell';
+  const feedback = document.createElement('span'); feedback.className = 'local-player-feedback'; feedback.setAttribute('aria-hidden', 'true');
+  const hud = document.createElement('div'); hud.className = 'local-player-hud';
+  const timeDisplay = document.createElement('span'); timeDisplay.className = 'local-player-time'; timeDisplay.setAttribute('aria-label', '재생 시간');
+  const progress = document.createElement('progress'); progress.className = 'local-player-progress'; progress.setAttribute('aria-label', '재생 위치');
+  progress.max = 1; progress.value = 0; timeDisplay.textContent = '0:00 / 0:00'; feedback.textContent = '';
+  hud.replaceChildren(timeDisplay, progress); shell.replaceChildren(video, feedback, hud); container.replaceChildren(shell);
   let destroyed = false, generation = 0, streamGeneration = 0, prepareGeneration = 0, stream;
   let duration = 0, videoId, path, wantPlay = false, ended = false, retried = false, failed = false, lastRecoverAt = 0;
-  let preparing = false, target, pendingTarget, seekTimer, bufferingTimer, prepareTimer, buffering = false, loadWait, targetRevision = 0, requestId = 0;
+  let preparing = false, target, pendingTarget, seekTimer, bufferingTimer, prepareTimer, feedbackTimer, buffering = false, loadWait, targetRevision = 0, requestId = 0;
   const seekWaiters = [];
   const clamp = sec => Math.min(duration, Math.max(0, Number(sec) || 0));
   const owns = s => !destroyed && stream === s && s.generation === streamGeneration && !s.dead;
@@ -107,6 +116,31 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
   const actual = () => clamp(Number(video.currentTime) || 0);
   const ownsRequest = (s, r) => owns(s) && s.request === r && !r.stopped;
   const getTime = () => ended ? duration : pendingTarget ?? target ?? actual();
+  function formatPlaybackTime(sec) {
+    const parts = formatTime(Math.floor(sec)).replace(/\.000$/, '').split(':');
+    if (parts.length !== 3) return parts.join(':');
+    const [hh, mm, ss] = parts;
+    return Number(hh) === 0 ? `${Number(mm)}:${ss}` : `${Number(hh)}:${mm}:${ss}`;
+  }
+  function renderPlayback() {
+    const displayDuration = Number.isFinite(duration) && duration >= 0 ? duration : 0;
+    const rawTime = getTime();
+    const current = Number.isFinite(rawTime) ? Math.min(displayDuration, Math.max(0, rawTime)) : 0;
+    timeDisplay.textContent = `${formatPlaybackTime(current)} / ${formatPlaybackTime(displayDuration)}`;
+    progress.value = displayDuration > 0 ? Math.min(1, Math.max(0, current / displayDuration)) : 0;
+  }
+  function resetFeedback() {
+    clearTimeout(feedbackTimer); feedbackTimer = undefined;
+    feedback.classList.remove('is-visible'); feedback.textContent = '';
+  }
+  function showFeedback(isPausing) {
+    clearTimeout(feedbackTimer); feedback.textContent = isPausing ? '❚❚' : '▶';
+    feedback.classList.add('is-visible');
+    feedbackTimer = setTimeout(() => {
+      if (destroyed) return;
+      feedback.classList.remove('is-visible'); feedbackTimer = undefined;
+    }, FEEDBACK_HOLD_MS);
+  }
   function stopBuffering() {
     clearTimeout(bufferingTimer); bufferingTimer = undefined;
     if (buffering) { buffering = false; onBuffering?.(false); }
@@ -148,7 +182,7 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
   }
   function finalFailure() {
     if (destroyed || failed) return;
-    failed = true; preparing = false; wantPlay = false; clearTimeout(prepareTimer);
+    failed = true; preparing = false; wantPlay = false; clearTimeout(prepareTimer); resetFeedback();
     dispose(); target = pendingTarget = undefined; settleSeeks(); stopBuffering(); video.pause();
     const error = failure(); settleLoad(error); onError?.(error);
   }
@@ -186,7 +220,7 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
     if (destroyed || failed || preparing || target !== undefined || pendingTarget !== undefined || !wantPlay || ended) return;
     const token = generation, s = stream;
     try { await video.play(); } catch {
-      if (!destroyed && generation === token && stream === s) { wantPlay = false; onError?.(failure()); }
+      if (!destroyed && generation === token && stream === s) { resetFeedback(); wantPlay = false; onError?.(failure()); }
     }
   }
   function align() {
@@ -397,7 +431,7 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
   function endpoint() {
     prepareGeneration++; preparing = false; clearTimeout(prepareTimer);
     targetRevision++; cancelReader(stream, 'endpoint'); clearTimeout(stream?.timer); settleSeeks(); pendingTarget = target = undefined;
-    ended = true; wantPlay = false; video.pause(); stopBuffering(); settleLoad(); onTime?.(duration);
+    ended = true; wantPlay = false; video.pause(); stopBuffering(); settleLoad(); onTime?.(duration); resetFeedback(); renderPlayback();
   }
   function maintenance() {
     const s = stream;
@@ -417,21 +451,23 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
     }
   }
   const listeners = {};
-  for (const name of ['loadedmetadata', 'canplay', 'playing', 'seeked', 'timeupdate']) listeners[name] = maintenance;
+  for (const name of ['loadedmetadata', 'canplay', 'playing', 'seeked', 'timeupdate']) listeners[name] = () => { maintenance(); renderPlayback(); };
   listeners.error = () => { if (videoOwns(stream)) void recover(stream); };
   listeners.ended = () => {
     if (videoOwns(stream) && !video.seeking && target === undefined && pendingTarget === undefined && actual() >= duration - 0.1) endpoint();
+    renderPlayback();
   };
-  listeners.click = () => { void api.togglePlay(); };
+  listeners.click = event => { if (event.target === video && event.button === 0 && !event.defaultPrevented) void api.togglePlay(); };
   for (const [name, fn] of Object.entries(listeners)) video.addEventListener(name, fn);
-  const pollTimer = setInterval(() => { if (!destroyed) { maintenance(); onTime?.(getTime()); } }, POLL_MS);
+  const pollTimer = setInterval(() => { if (!destroyed) { maintenance(); onTime?.(getTime()); renderPlayback(); } }, POLL_MS);
   const api = {
     load(metadata, timeSec = 0) {
       if (destroyed) return Promise.reject(new Error('SUPERSEDED'));
-      generation++; targetRevision++; clearTimeout(prepareTimer); stopBuffering(); settleSeeks(); settleLoad(new Error('SUPERSEDED')); dispose();
+      generation++; targetRevision++; clearTimeout(prepareTimer); stopBuffering(); resetFeedback(); settleSeeks(); settleLoad(new Error('SUPERSEDED')); dispose();
       videoId = metadata.videoId; duration = Math.max(0, Number(metadata.durationSec) || 0);
       target = clamp(timeSec); pendingTarget = undefined; path = undefined;
       wantPlay = ended = retried = failed = preparing = false;
+      renderPlayback();
       const promise = new Promise((resolve, reject) => {
         loadWait = { resolve, reject, timer: setTimeout(finalFailure, LOAD_TIMEOUT_MS) };
       });
@@ -444,6 +480,7 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
       if (next === duration) { endpoint(); return Promise.resolve(); }
       const s = stream;
       pendingTarget = next;
+      renderPlayback();
       if (!preparing && s?.sb && owns(s) && covering(video.buffered, next) >= 0) {
         settleSeeks(); stopBuffering(); target = next; s.assigned = undefined;
         armReadiness(s);
@@ -461,15 +498,21 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
     },
     async seekAndPlay(sec) { const pending = api.seek(sec); wantPlay = true; await pending; await play(); },
     async pause() { wantPlay = false; video.pause(); },
-    async togglePlay() { if (destroyed) return; if (wantPlay || !video.paused) await api.pause(); else { wantPlay = true; await play(); } },
+    async togglePlay() {
+      if (destroyed) return;
+      const isPausing = wantPlay || !video.paused;
+      if (Number.isFinite(duration) && duration > 0 && !failed && !ended) showFeedback(isPausing);
+      if (isPausing) await api.pause(); else { wantPlay = true; await play(); }
+    },
     getTime,
     destroy() {
       if (destroyed) return;
-      destroyed = true; generation++; clearTimeout(prepareTimer); stopBuffering(); settleSeeks(); settleLoad(new Error('SUPERSEDED')); dispose();
+      destroyed = true; generation++; clearTimeout(prepareTimer); stopBuffering(); resetFeedback(); settleSeeks(); settleLoad(new Error('SUPERSEDED')); dispose();
       target = pendingTarget = undefined; clearInterval(pollTimer);
       for (const [name, fn] of Object.entries(listeners)) video.removeEventListener(name, fn);
       video.pause(); video.removeAttribute('src'); video.load(); container.replaceChildren();
     },
   };
+  renderPlayback();
   return api;
 }
