@@ -24,7 +24,23 @@ class Events {
   listeners = new Map();
   addEventListener(name, fn) { if (!this.listeners.has(name)) this.listeners.set(name, new Set()); this.listeners.get(name).add(fn); }
   removeEventListener(name, fn) { const set = this.listeners.get(name); set?.delete(fn); if (!set?.size) this.listeners.delete(name); }
-  emit(name) { for (const fn of [...(this.listeners.get(name) || [])]) fn(); }
+  emit(name, overrides = {}) {
+    const event = {
+      type: name, button: 0, defaultPrevented: false, bubbles: name === 'click',
+      ...overrides,
+      type: name, target: this, currentTarget: this,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this.propagationStopped = true; },
+    };
+    let current = this;
+    while (current) {
+      event.currentTarget = current;
+      for (const fn of [...(current.listeners.get(name) || [])]) fn(event);
+      if (!(current instanceof FakeNode) || event.propagationStopped || event.bubbles === false) break;
+      current = current.parentNode;
+    }
+    return event;
+  }
 }
 const rangesOf = owner => ({ get length() { return owner.ranges.length; }, start: i => owner.ranges[i][0], end: i => owner.ranges[i][1] });
 function unionRanges(ranges) {
@@ -59,10 +75,39 @@ function applyWindow(ranges, sb) {
     .map(([start, end]) => [Math.max(start, sb.appendWindowStart), Math.min(end, sb.appendWindowEnd)])
     .filter(([start, end]) => end > start);
 }
-class FakeVideo extends Events {
+class FakeNode extends Events {
+  constructor(tagName) {
+    super();
+    this.tagName = String(tagName).toUpperCase();
+    this.className = '';
+    this.textContent = '';
+    this.parentNode = null;
+    this.children = [];
+    this.style = {};
+    this.attributes = new Map();
+    this.value = 0;
+    this.max = 0;
+    const tokens = () => this.className.split(/\s+/).filter(Boolean);
+    this.classList = {
+      add: (...names) => { this.className = [...new Set([...tokens(), ...names])].join(' '); },
+      remove: (...names) => { const removed = new Set(names); this.className = tokens().filter(name => !removed.has(name)).join(' '); },
+      contains: name => tokens().includes(name),
+    };
+  }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; }
+  removeAttribute(name) { this.attributes.delete(name); }
+  replaceChildren(...nodes) {
+    for (const child of this.children) child.parentNode = null;
+    this.children = [...nodes];
+    for (const child of this.children) child.parentNode = this;
+  }
+}
+class FakeVideo extends FakeNode {
   _currentTime = 0; paused = true; src = ''; currentSrc = ''; sources = []; ranges = []; readyState = 0; seeking = false;
   delayedSeek = false; throwBeforeMetadata = false; assignments = []; playCalls = 0; rejectPlay = false;
   buffered = rangesOf(this);
+  constructor() { super('video'); }
   get currentTime() { return this._currentTime; }
   set currentTime(value) {
     if (this.throwBeforeMetadata && !this.readyState) throw new Error('metadata unavailable');
@@ -73,13 +118,13 @@ class FakeVideo extends Events {
   load() { this.currentSrc = this.src; this._currentTime = 0; this.ranges = []; this.readyState = 0; this.seeking = false; this.paused = true; if (this.src) this.sources.push(this.src); }
   async play() { this.playCalls++; if (this.rejectPlay) throw new Error('autoplay'); this.paused = false; }
   pause() { this.paused = true; }
-  removeAttribute(name) { if (name === 'src') this.src = ''; }
+  removeAttribute(name) { if (name === 'src') this.src = ''; else super.removeAttribute(name); }
 }
 function fixture(t, options = {}) {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const saved = new Map(['document', 'MediaSource', 'fetch'].map(name => [name, globalThis[name]]));
   const oldCreate = URL.createObjectURL, oldRevoke = URL.revokeObjectURL;
-  const video = new FakeVideo(), errors = [], times = [], buffering = [], sources = [], fetches = [], live = new Set(), revoked = [];
+  const video = new FakeVideo(), container = new FakeNode('div'), nodes = [], errors = [], times = [], buffering = [], sources = [], fetches = [], live = new Set(), revoked = [];
   let prepareCalls = 0, auto = options.auto !== false, supported = true;
   const absolute = options.absolute !== false, log = [], mediaAppendIndex = new Map();
   class SourceBuffer extends Events {
@@ -150,7 +195,15 @@ function fixture(t, options = {}) {
   }
   URL.createObjectURL = () => { log.push(['createObjectURL']); const url = `blob:test/${sources.length}`; live.add(url); return url; };
   URL.revokeObjectURL = url => { assert.equal(live.delete(url), true); revoked.push(url); };
-  globalThis.document = { getElementById: () => ({ replaceChildren() {} }), createElement: () => video };
+  globalThis.document = {
+    getElementById: () => container,
+    createElement: tag => {
+      if (tag === 'video') return video;
+      const node = new FakeNode(tag);
+      nodes.push(node);
+      return node;
+    },
+  };
   globalThis.MediaSource = MS;
   globalThis.fetch = (url, { signal }) => {
     const request = { url, signal, reads: 0, cancels: 0, active: 0, maxActive: 0, queue: [], waiter: undefined, cancelled: false };
@@ -186,7 +239,7 @@ function fixture(t, options = {}) {
     for (const [name, value] of saved) { if (value === undefined) delete globalThis[name]; else globalThis[name] = value; }
     URL.createObjectURL = oldCreate; URL.revokeObjectURL = oldRevoke;
   });
-  const f = { player, video, errors, times, buffering, sources, fetches, live, revoked, MS, log,
+  const f = { player, video, container, nodes, find: className => nodes.find(node => node.classList.contains(className)), errors, times, buffering, sources, fetches, live, revoked, MS, log,
     get prepares() { return prepareCalls; }, get sb() { return sources.at(-1)?.sb; },
     setAuto(value) { auto = value; }, setSupported(value) { supported = value; },
     start(start = 10, durationSec = 1000) {
