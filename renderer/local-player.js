@@ -368,6 +368,7 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
               if (end - r.bufferEnd < 0.001) s.actualEnd = end;
             }
             r.eof = true; r.stopped = true; r.stopReason = 'eof';
+            if (r.purpose === 'seek' && !preparing && seekTimer === undefined && pendingTarget === undefined && target === r.target && target > 0 && target >= duration - 0.1 && covering(video.buffered, target) < 0) endpoint();
           }
           return;
         }
@@ -435,6 +436,15 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
     targetRevision++; cancelReader(stream, 'endpoint'); clearTimeout(stream?.timer); settleSeeks(); pendingTarget = target = undefined;
     ended = true; wantPlay = false; video.pause(); stopBuffering(); settleLoad(); onTime?.(duration); resetFeedback(); renderPlayback();
   }
+  function isEndpointTarget(sec) {
+    if (sec === duration) return true;
+    const s = stream;
+    if (!videoOwns(s) || preparing) return false;
+    if (Number.isFinite(s.actualEnd) && sec >= s.actualEnd) return true;
+    if (!video.buffered.length) return false;
+    const end = video.buffered.end(video.buffered.length - 1);
+    return Number.isFinite(end) && duration - 0.1 <= end && end <= duration && sec >= end;
+  }
   function maintenance() {
     const s = stream;
     if (!videoOwns(s)) return;
@@ -488,7 +498,7 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
     seek(sec) {
       if (destroyed || failed) return Promise.resolve();
       const next = clamp(sec); ended = false; targetRevision++;
-      if (next === duration) { endpoint(); return Promise.resolve(); }
+      if (isEndpointTarget(next)) { endpoint(); return Promise.resolve(); }
       const s = stream;
       pendingTarget = next;
       renderPlayback();
@@ -507,7 +517,7 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
       }, SEEK_MS);
       return promise;
     },
-    async seekAndPlay(sec) { const pending = api.seek(sec); wantPlay = true; await pending; await play(); },
+    async seekAndPlay(sec) { const pending = api.seek(sec); wantPlay = !ended; await pending; await play(); },
     async pause() { wantPlay = false; video.pause(); },
     async togglePlay() {
       if (destroyed) return;
