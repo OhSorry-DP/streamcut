@@ -28,11 +28,11 @@ class Events {
     const event = {
       type: name, button: 0, defaultPrevented: false, bubbles: name === 'click',
       ...overrides,
-      type: name, target: this, currentTarget: this,
+      type: name, target: overrides.target ?? this, currentTarget: this,
       preventDefault() { this.defaultPrevented = true; },
       stopPropagation() { this.propagationStopped = true; },
     };
-    let current = this;
+  let current = this;
     while (current) {
       event.currentTarget = current;
       for (const fn of [...(current.listeners.get(name) || [])]) fn(event);
@@ -779,4 +779,103 @@ test('absolute eviction removes eligible whole ranges before trimming a protecte
   f.video.emit('timeupdate'); await flush();
   assert.deepEqual(f.sb.calls.filter(([kind]) => kind === 'remove'), [['remove', 950, 960], ['remove', 0, 60], ['remove', 60, 120], ['remove', 120, 180]]);
   assert.deepEqual(f.sb.ranges, [[180, 900]]); assert.equal(f.prepares, 1);
+});
+
+test('local player renders its DOM and formats playback time across hour boundaries', async t => {
+  const f = fixture(t), shell = f.find('local-player-shell'), feedback = f.find('local-player-feedback');
+  const hud = f.find('local-player-hud'), time = f.find('local-player-time'), progress = f.find('local-player-progress');
+  assert.deepEqual(shell.children, [f.video, feedback, hud]);
+  assert.deepEqual(f.container.children, [shell]);
+  assert.deepEqual(hud.children, [time, progress]);
+  assert.equal(feedback.getAttribute('aria-hidden'), 'true');
+  assert.equal(time.getAttribute('aria-label'), '재생 시간');
+  assert.equal(progress.getAttribute('aria-label'), '재생 위치');
+  assert.equal(progress.max, 1); assert.equal(progress.value, 0);
+  assert.equal(time.textContent, '0:00 / 0:00');
+  assert.equal(feedback.textContent, ''); assert.equal(feedback.classList.contains('is-visible'), false);
+  await f.load(83.75, 2706.9); assert.equal(time.textContent, '1:23 / 45:06'); assert.ok(Math.abs(progress.value - 83.75 / 2706.9) <= 1e-12);
+  await f.load(3599.999, 7200); assert.equal(time.textContent, '59:59 / 2:00:00');
+  await f.load(3600, 7200); assert.equal(time.textContent, '1:00:00 / 2:00:00');
+  await f.load(360000, 360010); assert.equal(time.textContent, '100:00:00 / 100:00:10');
+  await f.load(0, 0); assert.equal(time.textContent, '0:00 / 0:00'); assert.equal(progress.value, 0); assert.equal(Number.isFinite(progress.value), true);
+});
+
+test('local player keeps source time while polling, seeking, and returning from the endpoint', async t => {
+  const f = fixture(t); await f.load(70, 1000);
+  const time = f.find('local-player-time'), progress = f.find('local-player-progress');
+  assert.equal(time.textContent, '1:10 / 16:40');
+  f.video._currentTime = 84.25;
+  t.mock.timers.tick(249); assert.equal(time.textContent, '1:10 / 16:40');
+  const previousPolls = f.times.length; t.mock.timers.tick(1);
+  assert.equal(time.textContent, '1:24 / 16:40'); assert.equal(progress.value, 0.08425); assert.equal(f.times.length, previousPolls + 1);
+  f.range([[70, 90]], 84.25); const fetchCount = f.fetches.length;
+  const pending = f.player.seek(700);
+  assert.equal(time.textContent, '11:40 / 16:40'); assert.equal(progress.value, 0.7); assert.equal(f.video.currentTime, 84.25);
+  t.mock.timers.tick(120); await pending; await f.ready();
+  assert.equal(f.video.currentTime, 700); assert.equal(time.textContent, '11:40 / 16:40');
+  const fetchCountBeforeEndpoint = f.fetches.length;
+  await f.player.seek(1000); assert.equal(time.textContent, '16:40 / 16:40'); assert.equal(progress.value, 1); assert.equal(f.times.at(-1), 1000);
+  assert.equal(f.fetches.length, fetchCountBeforeEndpoint);
+  const fetchCountBeforeReturn = f.fetches.length;
+  await f.player.seek(75); assert.equal(time.textContent, '1:15 / 16:40'); assert.equal(progress.value, 0.075);
+  assert.equal(f.fetches.length, fetchCountBeforeReturn); assert.ok(f.fetches.length >= fetchCount);
+});
+
+test('only an unmodified primary click on the video toggles playback', async t => {
+  const f = fixture(t); await f.load(10);
+  let calls = 0; const original = f.player.togglePlay;
+  t.mock.method(f.player, 'togglePlay', function (...args) { calls++; return original.apply(this, args); });
+  const shell = f.find('local-player-shell'), hud = f.find('local-player-hud');
+  const time = f.find('local-player-time'), progress = f.find('local-player-progress');
+  f.video.emit('click'); await flush(); assert.equal(f.video.paused, false); assert.equal(calls, 1);
+  f.video.emit('click'); await flush(); assert.equal(f.video.paused, true); assert.equal(calls, 2);
+  for (const node of [shell, hud, time, progress, f.container]) { node.emit('click'); await flush(); assert.equal(calls, 2); assert.equal(f.video.paused, true); }
+  f.video.emit('click', { target: hud }); f.video.emit('click', { button: 2 }); f.video.emit('click', { defaultPrevented: true });
+  assert.equal(calls, 2); assert.equal(f.video.paused, true);
+  const fake = document.createElement('button'); f.video.parentNode.parentNode.replaceChildren(f.video.parentNode, fake);
+  fake.emit('click'); assert.equal(calls, 2); assert.equal(f.video.paused, true);
+});
+
+test('play feedback lasts 450ms from the latest toggle and excludes automatic pauses', async t => {
+  const f = fixture(t); await f.load(10);
+  const feedback = f.find('local-player-feedback');
+  f.video.emit('click'); await flush(); assert.equal(feedback.textContent, '▶'); assert.equal(feedback.classList.contains('is-visible'), true);
+  t.mock.timers.tick(400); f.video.emit('click'); await flush(); assert.equal(feedback.textContent, '❚❚'); assert.equal(feedback.classList.contains('is-visible'), true);
+  t.mock.timers.tick(50); assert.equal(feedback.textContent, '❚❚'); assert.equal(feedback.classList.contains('is-visible'), true);
+  t.mock.timers.tick(399); assert.equal(feedback.classList.contains('is-visible'), true);
+  t.mock.timers.tick(1); assert.equal(feedback.classList.contains('is-visible'), false);
+  await f.player.togglePlay(); assert.equal(feedback.textContent, '▶'); assert.equal(feedback.classList.contains('is-visible'), true);
+  t.mock.timers.tick(450); await f.player.pause(); assert.equal(feedback.classList.contains('is-visible'), false);
+  f.range([[10, 30]], 10); await f.player.seekAndPlay(20); await flush(); assert.equal(feedback.classList.contains('is-visible'), false);
+});
+
+test('play rejection and final recovery failure clear playback feedback', async t => {
+  const f = fixture(t); await f.load(10);
+  const feedback = f.find('local-player-feedback');
+  f.video.rejectPlay = true; f.video.emit('click'); await flush();
+  assert.equal(f.video.paused, true); assert.equal(f.errors.length, 1); assert.equal(feedback.textContent, ''); assert.equal(feedback.classList.contains('is-visible'), false);
+  t.mock.timers.tick(1000); await flush(); assert.equal(feedback.classList.contains('is-visible'), false);
+  f.video.rejectPlay = false; f.video.emit('click'); await flush(); assert.equal(feedback.classList.contains('is-visible'), true);
+  f.video.emit('error'); await flush(); await f.ready();
+  assert.equal(f.errors.length, 1);
+  f.video.emit('error'); await flush(); assert.equal(f.errors.length, 2); assert.equal(feedback.textContent, ''); assert.equal(feedback.classList.contains('is-visible'), false);
+  t.mock.timers.tick(1000); await flush(); assert.equal(feedback.classList.contains('is-visible'), false);
+});
+
+test('reload and destroy clear feedback timers, DOM listeners, and callbacks', async t => {
+  const f = fixture(t); await f.load(10);
+  const feedback = f.find('local-player-feedback'), time = f.find('local-player-time');
+  f.video.emit('click'); await flush(); assert.equal(feedback.classList.contains('is-visible'), true);
+  t.mock.timers.tick(100); await f.load(83, 2706);
+  assert.equal(feedback.textContent, ''); assert.equal(feedback.classList.contains('is-visible'), false);
+  assert.equal(time.textContent, '1:23 / 45:06'); assert.equal(f.find('local-player-progress').value, 83 / 2706);
+  t.mock.timers.tick(350); assert.equal(time.textContent, '1:23 / 45:06'); assert.equal(feedback.classList.contains('is-visible'), false);
+  f.video.emit('click'); await flush(); assert.equal(feedback.classList.contains('is-visible'), true);
+  const shell = f.find('local-player-shell'), timeCount = f.times.length;
+  f.player.destroy();
+  assert.deepEqual(f.container.children, []); assert.equal(f.video.listeners.size, 0);
+  assert.equal(feedback.classList.contains('is-visible'), false); assert.equal(feedback.textContent, ''); assert.equal(shell.parentNode, null);
+  t.mock.timers.tick(1000); await flush(); f.video.emit('click');
+  assert.equal(f.times.length, timeCount); assert.deepEqual(f.container.children, []);
+  assert.equal(feedback.classList.contains('is-visible'), false); assert.equal(f.live.size, 0);
 });
