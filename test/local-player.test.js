@@ -967,3 +967,71 @@ test('local player reload and endpoint clicks retain the seekAndPlay path', asyn
   t.mock.timers.tick(120); await flush(); await f.ready();
   assert.equal(f.player.getTime(), 0); assert.equal(f.video.paused, false); assert.deepEqual(seeks, [20, 1000, 0]);
 });
+
+test('소수 끝 밖 seek는 endpoint로 끝나고 같은 MSE 캐시에서 복귀한다', async t => {
+  const f = fixture(t, { absolute: true, mediaScript: { fragments: [{ video: [[0, 18.96]] }] } });
+  await f.load(0, 19); await f.player.togglePlay(); await flush();
+  const sb = f.sb, url = f.video.src, counts = [f.fetches.length, f.sources.length, f.prepares];
+  const pending = f.player.seekAndPlay(18.9696); t.mock.timers.tick(120); await pending; await flush();
+  assert.equal(f.player.getTime(), 19); assert.equal(f.find('local-player-time').textContent, '0:19 / 0:19');
+  assert.equal(f.find('local-player-progress').value, 1); assert.equal(f.video.paused, true);
+  assert.equal(f.sb, sb); assert.equal(f.video.src, url);
+  assert.deepEqual([f.fetches.length, f.sources.length, f.prepares], counts); assert.deepEqual(f.errors, []);
+  const back = f.player.seekAndPlay(1.9); t.mock.timers.tick(120); await back; await flush();
+  assert.equal(f.player.getTime(), 1.9); assert.equal(f.video.paused, false); assert.equal(f.fetches.length, counts[0]);
+});
+
+test('진행바 소수 끝 seek는 계산된 목표를 그대로 endpoint 처리한다', async t => {
+  let f; const seeks = [];
+  f = fixture(t, { absolute: true, mediaScript: { fragments: [{ video: [[0, 18.96]] }] }, onSeek: sec => { seeks.push(sec); void f.player.seekAndPlay(sec); } });
+  await f.load(0, 19);
+  const hit = f.find('local-player-progress-hit'); hit.getBoundingClientRect = () => ({ left: 0, width: 1000 });
+  hit.emit('click', { clientX: 998.4 });
+  assert.equal(seeks.length, 1); assert.ok(Math.abs(seeks[0] - 18.9696) <= 1e-9);
+  t.mock.timers.tick(120); await flush();
+  assert.equal(f.player.getTime(), 19); assert.equal(f.video.paused, true);
+  assert.equal(f.find('local-player-time').textContent, '0:19 / 0:19'); assert.equal(f.find('local-player-progress').value, 1);
+  assert.equal(f.fetches.length, 1); assert.deepEqual(f.errors, []);
+});
+
+test('actualEnd 밖 seek는 추가 요청 없이 끝나고 알려진 캐시로 복귀한다', async t => {
+  const f = fixture(t, { absolute: true, mediaScript: ({ sb }) => ({ fragments: sb.timestampOffset === 10 ? [{ video: [[0, 5]] }] : [] }) });
+  await f.load(10, 1000); await f.player.togglePlay(); await f.push(null);
+  f.video.emit('timeupdate'); await flush(); await f.push(null);
+  const pending = f.player.seekAndPlay(16); t.mock.timers.tick(120); await pending; await flush();
+  assert.equal(f.player.getTime(), 1000); assert.equal(f.video.paused, true); assert.equal(f.fetches.length, 2); assert.deepEqual(f.errors, []);
+  const back = f.player.seekAndPlay(12); t.mock.timers.tick(120); await back; await flush();
+  assert.equal(f.player.getTime(), 12); assert.equal(f.video.paused, false); assert.equal(f.fetches.length, 2);
+});
+
+test('seek 응답의 초기화 전용 EOF는 끝 HUD로 종료되고 readiness 복구하지 않는다', async t => {
+  const f = fixture(t, { absolute: true, mediaScript: ({ sb }) => ({ fragments: sb.timestampOffset === 0 ? [{ video: [[0, 5]] }] : [] }) });
+  await f.load(0, 19); f.range([[0, 5]], 0);
+  const pending = f.player.seekAndPlay(18.97); t.mock.timers.tick(120); await pending; await flush();
+  await f.push(null); await flush();
+  assert.equal(f.player.getTime(), 19); assert.equal(f.video.paused, true);
+  assert.equal(f.find('local-player-time').textContent, '0:19 / 0:19'); assert.deepEqual(f.errors, []);
+  const prepares = f.prepares; t.mock.timers.tick(15000); await flush(); assert.equal(f.prepares, prepares);
+});
+
+test('끝 직전 정상 목표와 알려진 끝보다 앞선 seek는 endpoint로 올리지 않는다', async t => {
+  const f = fixture(t, { absolute: true }); await f.load(0, 19); f.range([[0, 18.96]], 1);
+  const near = f.player.seek(18.959); assert.equal(f.video.currentTime, 18.959); await near;
+  f.range([[0, 5]], 1); const count = f.fetches.length;
+  const outside = f.player.seek(6); t.mock.timers.tick(120); await outside; await flush();
+  assert.equal(f.fetches.length, count + 1); assert.equal(f.player.getTime(), 6);
+});
+
+test('끝 경계 seek는 timer를 해제하고 재생 시도 뒤 캐시 seek로 복귀한다', async t => {
+  const f = fixture(t, { absolute: true, mediaScript: { fragments: [{ video: [[0, 18.96]] }] } });
+  await f.load(0, 19);
+  const pending = f.player.seekAndPlay(18.96); t.mock.timers.tick(120); await pending; await flush();
+  assert.equal(f.player.getTime(), 19); assert.equal(f.video.paused, true);
+  await f.player.togglePlay(); assert.equal(f.video.paused, true);
+  const counts = [f.prepares, f.sources.length, f.fetches.length];
+  t.mock.timers.tick(15000); await flush();
+  assert.deepEqual([f.prepares, f.sources.length, f.fetches.length], counts);
+  assert.notEqual(f.buffering.at(-1), true); assert.deepEqual(f.errors, []);
+  const back = f.player.seekAndPlay(1.9); t.mock.timers.tick(120); await back; await flush();
+  assert.equal(f.player.getTime(), 1.9); assert.equal(f.video.paused, false);
+});
