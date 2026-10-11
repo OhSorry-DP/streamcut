@@ -1,4 +1,5 @@
 import { formatTime } from '../lib/time.js';
+import { xToTime } from '../lib/timeline.js';
 
 const POLL_MS = 250, SEEK_MS = 120, BUFFERING_DELAY_MS = 250, LOAD_TIMEOUT_MS = 15000, RECOVER_COOLDOWN_MS = 15000;
 const FEEDBACK_HOLD_MS = 450;
@@ -96,7 +97,7 @@ function covering(ranges, time) {
   return -1;
 }
 
-export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuffering } = {}) {
+export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuffering, onSeek } = {}) {
   const container = document.getElementById(containerId), video = document.createElement('video');
   video.className = 'local-player'; video.playsInline = true; video.preload = 'auto';
   const shell = document.createElement('div'); shell.className = 'local-player-shell';
@@ -104,8 +105,9 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
   const hud = document.createElement('div'); hud.className = 'local-player-hud';
   const timeDisplay = document.createElement('span'); timeDisplay.className = 'local-player-time'; timeDisplay.setAttribute('aria-label', '재생 시간');
   const progress = document.createElement('progress'); progress.className = 'local-player-progress'; progress.setAttribute('aria-label', '재생 위치');
+  const progressHit = document.createElement('div'); progressHit.className = 'local-player-progress-hit';
   progress.max = 1; progress.value = 0; timeDisplay.textContent = '0:00 / 0:00'; feedback.textContent = '';
-  hud.replaceChildren(timeDisplay, progress); shell.replaceChildren(video, feedback, hud); container.replaceChildren(shell);
+  progressHit.replaceChildren(progress); hud.replaceChildren(timeDisplay, progressHit); shell.replaceChildren(video, feedback, hud); container.replaceChildren(shell);
   let destroyed = false, generation = 0, streamGeneration = 0, prepareGeneration = 0, stream;
   let duration = 0, videoId, path, wantPlay = false, ended = false, retried = false, failed = false, lastRecoverAt = 0;
   let preparing = false, target, pendingTarget, seekTimer, bufferingTimer, prepareTimer, feedbackTimer, buffering = false, loadWait, targetRevision = 0, requestId = 0;
@@ -459,6 +461,15 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
   };
   listeners.click = event => { if (event.target === video && event.button === 0 && !event.defaultPrevented) void api.togglePlay(); };
   for (const [name, fn] of Object.entries(listeners)) video.addEventListener(name, fn);
+  const onProgressClick = event => {
+    event.stopPropagation();
+    if (event.defaultPrevented || event.button !== 0) return;
+    if (destroyed || failed || loadWait || videoId === undefined || !Number.isFinite(duration) || duration <= 0 || typeof onSeek !== 'function') return;
+    const rect = progressHit.getBoundingClientRect();
+    if (!Number.isFinite(event.clientX) || !Number.isFinite(rect.left) || !Number.isFinite(rect.width) || rect.width <= 0) return;
+    onSeek(xToTime(event.clientX - rect.left, rect.width, { scrollSec: 0, zoom: 1 }, duration));
+  };
+  progressHit.addEventListener('click', onProgressClick);
   const pollTimer = setInterval(() => { if (!destroyed) { maintenance(); onTime?.(getTime()); renderPlayback(); } }, POLL_MS);
   const api = {
     load(metadata, timeSec = 0) {
@@ -510,6 +521,7 @@ export function createLocalPlayer(containerId, { prepare, onTime, onError, onBuf
       destroyed = true; generation++; clearTimeout(prepareTimer); stopBuffering(); resetFeedback(); settleSeeks(); settleLoad(new Error('SUPERSEDED')); dispose();
       target = pendingTarget = undefined; clearInterval(pollTimer);
       for (const [name, fn] of Object.entries(listeners)) video.removeEventListener(name, fn);
+      progressHit.removeEventListener('click', onProgressClick);
       video.pause(); video.removeAttribute('src'); video.load(); container.replaceChildren();
     },
   };
